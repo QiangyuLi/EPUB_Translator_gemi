@@ -13,13 +13,16 @@ from google.api_core import exceptions as google_api_exceptions
 MODEL_NAME = "gemini-2.0-flash-lite"
 
 # Reverted to a simpler, less restrictive default translation prompt.
-DEFAULT_TRANSLATION_PROMPT = """TTranslate the following content into Simplified Chinese **only if it is clearly natural, human-readable language** (such as complete sentences, phrases, documentation, or dialog).
-Do **not translate** or modify the input if it:
-- Appears to be technical syntax, structured formats, or code (e.g., XML, HTML, JSON, scripts, config files).
-- Is a Roman numeral, file path, variable name, command, version string, log entry, or similar non-linguistic content.
-- Consists of ambiguous or contextless short tokens, acronyms, identifiers, or single letters that lack translatable meaning.
-If the input **cannot be confidently translated as natural language**, **return it exactly as it was received**, without modification, formatting, or wrapping.
-Do **not** include any headers, labels, or explanations like “Original:” or “Translated:”. Your response should contain **only the translated text** or the **original text unchanged**, as appropriate.
+DEFAULT_TRANSLATION_PROMPT = """
+Translate the following content into Simplified Chinese **only if the text clearly consists of meaningful, natural language** — such as full sentences, phrases, documentation, or conversational content.
+Do **not translate** or modify the input if it meets **any** of the following conditions:
+- It is structured content such as XML, HTML, JSON, or programming code.
+- It contains markup, configuration, commands, paths, keys, tags, or variable names.
+- It is composed only of symbols, placeholders, punctuation (e.g., ——— or ***), or lacks any semantic meaning.
+- It is an isolated number, acronym, abbreviation, or Roman numeral without context.
+- It is ambiguous or contextless and cannot be reliably identified as human language.
+If the text **does not meet the criteria for confident, accurate translation**, return it **exactly as received**, with **no modifications**, **no formatting**, and **no added or invented content**.
+Do **not include** any introductory text, explanation, or labels. Output only the translated text, or the original text unchanged if translation is not applicable.
 """
 # --- Helper Functions ---
 
@@ -203,27 +206,6 @@ def cleanup_temp_dir(temp_dir):
 # --- Main Command-Line Process ---
 
 def main():
-    """
-    Main entry point for the EPUB translation script.
-    This function parses command-line arguments to configure the translation process,
-    including the input EPUB file, Google Gemini API key, output and temporary directories,
-    and an optional custom translation prompt. It validates the provided arguments,
-    sets up the translation environment, manages incremental translation status,
-    and orchestrates the extraction, translation, and re-packaging of the EPUB file.
-    Key steps:
-    - Parses arguments for input EPUB, API key, output/temp directories, and prompt file.
-    - Determines and validates the API key and translation prompt.
-    - Validates the EPUB file path and type.
-    - Sets up the Gemini API and translation model.
-    - Manages a temporary working directory for EPUB extraction and translation status.
-    - Supports incremental translation by tracking file status in a JSON file.
-    - Extracts EPUB contents if needed, finds HTML/XHTML files, and translates them.
-    - Writes translation status after each file to support resuming interrupted work.
-    - Repackages the translated files into a new EPUB.
-    - Cleans up temporary files if translation is fully completed, or preserves them for incremental work.
-    Returns:
-        None
-    """
     parser = argparse.ArgumentParser(
         description="Translate an EPUB file into Simplified Chinese using Google Gemini API."
     )
