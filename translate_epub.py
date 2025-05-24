@@ -12,9 +12,15 @@ from google.api_core import exceptions as google_api_exceptions
 # --- Configuration ---
 MODEL_NAME = "gemini-2.0-flash-lite"
 
-# Built-in default translation prompt
-DEFAULT_TRANSLATION_PROMPT = "Translate the following text into Simplified Chinese:\n\n"
-
+# Reverted to a simpler, less restrictive default translation prompt.
+DEFAULT_TRANSLATION_PROMPT = """TTranslate the following content into Simplified Chinese **only if it is clearly natural, human-readable language** (such as complete sentences, phrases, documentation, or dialog).
+Do **not translate** or modify the input if it:
+- Appears to be technical syntax, structured formats, or code (e.g., XML, HTML, JSON, scripts, config files).
+- Is a Roman numeral, file path, variable name, command, version string, log entry, or similar non-linguistic content.
+- Consists of ambiguous or contextless short tokens, acronyms, identifiers, or single letters that lack translatable meaning.
+If the input **cannot be confidently translated as natural language**, **return it exactly as it was received**, without modification, formatting, or wrapping.
+Do **not** include any headers, labels, or explanations like “Original:” or “Translated:”. Your response should contain **only the translated text** or the **original text unchanged**, as appropriate.
+"""
 # --- Helper Functions ---
 
 def setup_gemini_api(api_key):
@@ -48,23 +54,24 @@ def translate_text(text_content, model, base_prompt):
             response = model.generate_content(prompt)
 
             if response and response.text:
-                translated_text = response.text
+                translated_text = response.text.strip() # Strip whitespace from translation too
+                
                 print(f"  Original: {text_content[:70]}{'...' if len(text_content) > 70 else ''}")
                 print(f"  Translated: {translated_text[:70]}{'...' if len(translated_text) > 70 else ''}\n")
                 return translated_text, True # Return translated text and success flag
             else:
                 print(f"Attempt {attempt + 1}: No translation found in API response for text: '{text_content[:50]}...'")
                 if attempt < max_retries - 1:
-                    wait_time = initial_wait_time * (2 ** attempt) # Exponential backoff
+                    wait_time = initial_wait_time * (2 ** attempt)
                     print(f"  Waiting {wait_time} seconds before retrying...")
                     time.sleep(wait_time)
                 else:
                     print("Max retries reached. Skipping translation for this segment.")
-                    return text_content, False # Return original text and failure flag
+                    return text_content, False
         except google_api_exceptions.ResourceExhausted as e:
             print(f"Attempt {attempt + 1}: Rate limit exceeded for text: '{text_content[:50]}...'")
             if attempt < max_retries - 1:
-                wait_time = initial_wait_time * (2 ** attempt) # Exponential backoff
+                wait_time = initial_wait_time * (2 ** attempt)
                 print(f"  Waiting {wait_time} seconds due to rate limit before retrying...")
                 time.sleep(wait_time)
             else:
@@ -73,7 +80,7 @@ def translate_text(text_content, model, base_prompt):
         except Exception as e:
             print(f"Attempt {attempt + 1}: General API error: {e} for text: '{text_content[:50]}...'")
             if attempt < max_retries - 1:
-                wait_time = initial_wait_time * (2 ** attempt) # Exponential backoff
+                wait_time = initial_wait_time * (2 ** attempt)
                 print(f"  Waiting {wait_time} seconds due to error before retrying...")
                 time.sleep(wait_time)
             else:
@@ -108,23 +115,48 @@ def translate_html_file(file_path, model, base_prompt, translation_status_dict):
     """
     file_had_errors = False
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        # Read file in binary mode to preserve encoding and potential BOM
+        with open(file_path, 'rb') as f:
+            content_bytes = f.read()
 
-        soup = BeautifulSoup(content, 'html.parser')
+        # Determine parser based on lxml availability. No specific .xhtml vs .html handling.
+        parser_name = 'html.parser' # Default fallback parser
+        try:
+            import lxml # Try to import lxml
+            parser_name = 'lxml' # Use lxml for general HTML parsing
+        except ImportError:
+            pass # lxml not installed, stick to html.parser
+
+        try:
+            soup = BeautifulSoup(content_bytes, parser_name)
+        except Exception as e:
+            # If the chosen parser fails, try html.parser as a last resort
+            print(f"Error parsing {os.path.basename(file_path)} with '{parser_name}': {e}. Attempting with 'html.parser'.")
+            try:
+                soup = BeautifulSoup(content_bytes, 'html.parser')
+            except Exception as inner_e:
+                print(f"Critical: Failed to parse {os.path.basename(file_path)} even with 'html.parser': {inner_e}. Skipping file.")
+                translation_status_dict[file_path] = "failed"
+                return False
+
 
         for text_node in soup.find_all(string=True):
+            # Exclude script, style, title, meta, link, head, noscript, code tags
             if text_node.parent.name not in ['script', 'style', 'title', 'meta', 'link', 'head', 'noscript', 'code']:
                 original_text = str(text_node).strip()
-                if original_text:
+                
+                # No advanced content filtering (e.g., for XML declarations, numbers) here
+                # All text will be sent to API, relying on model to handle it based on prompt
+                if original_text: # Ensure it's not empty after stripping
                     translated_text, success = translate_text(original_text, model, base_prompt)
                     if not success:
                         file_had_errors = True
                     if translated_text:
                         text_node.replace_with(translated_text)
 
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(str(soup))
+        # Write file in binary mode with explicit UTF-8 encoding
+        with open(file_path, 'wb') as f:
+            f.write(soup.encode('utf-8'))
 
         if file_had_errors:
             translation_status_dict[file_path] = "failed"
@@ -171,6 +203,27 @@ def cleanup_temp_dir(temp_dir):
 # --- Main Command-Line Process ---
 
 def main():
+    """
+    Main entry point for the EPUB translation script.
+    This function parses command-line arguments to configure the translation process,
+    including the input EPUB file, Google Gemini API key, output and temporary directories,
+    and an optional custom translation prompt. It validates the provided arguments,
+    sets up the translation environment, manages incremental translation status,
+    and orchestrates the extraction, translation, and re-packaging of the EPUB file.
+    Key steps:
+    - Parses arguments for input EPUB, API key, output/temp directories, and prompt file.
+    - Determines and validates the API key and translation prompt.
+    - Validates the EPUB file path and type.
+    - Sets up the Gemini API and translation model.
+    - Manages a temporary working directory for EPUB extraction and translation status.
+    - Supports incremental translation by tracking file status in a JSON file.
+    - Extracts EPUB contents if needed, finds HTML/XHTML files, and translates them.
+    - Writes translation status after each file to support resuming interrupted work.
+    - Repackages the translated files into a new EPUB.
+    - Cleans up temporary files if translation is fully completed, or preserves them for incremental work.
+    Returns:
+        None
+    """
     parser = argparse.ArgumentParser(
         description="Translate an EPUB file into Simplified Chinese using Google Gemini API."
     )
@@ -186,6 +239,10 @@ def main():
         "--output_dir",
         default=".",
         help="Directory to save the translated EPUB. Defaults to current directory."
+    )
+    parser.add_argument(
+        "--temp_dir",
+        help="Optional: Specific directory to extract EPUB contents and manage translation status. Defaults to a dynamically named folder in the current directory."
     )
     parser.add_argument(
         "--prompt_file",
@@ -240,12 +297,21 @@ def main():
     epub_filename = os.path.basename(epub_path)
     epub_name_without_ext = os.path.splitext(epub_filename)[0]
 
-    temp_dir = os.path.join(os.getcwd(), f'temp_epub_translation_{epub_name_without_ext}')
+    # Determine temporary directory path
+    if args.temp_dir:
+        temp_dir = os.path.abspath(args.temp_dir)
+        print(f"Using specified temporary directory: {temp_dir}")
+    else:
+        temp_dir = os.path.join(os.getcwd(), f'temp_epub_translation_{epub_name_without_ext}')
+        print(f"Using default temporary directory: {temp_dir}")
+
     output_epub_filename = f"{epub_name_without_ext}_zh-Hans.epub"
     output_epub_path = os.path.join(os.path.abspath(args.output_dir), output_epub_filename)
-    status_file_path = os.path.join(os.path.abspath(args.output_dir), f'{epub_name_without_ext}_translation_status.json')
+    # Status file is now always inside the temp_dir
+    status_file_path = os.path.join(temp_dir, f'{epub_name_without_ext}_translation_status.json')
 
-    os.makedirs(os.path.abspath(args.output_dir), exist_ok=True)
+    os.makedirs(os.path.abspath(args.output_dir), exist_ok=True) # Ensure output dir exists
+    os.makedirs(temp_dir, exist_ok=True) # Ensure temp_dir exists
 
     translation_status = {}
     if os.path.exists(status_file_path):
@@ -265,7 +331,6 @@ def main():
 
     if not os.path.exists(temp_dir) or not os.listdir(temp_dir):
          print(f"Temporary directory '{temp_dir}' is empty or does not exist. Extracting EPUB.")
-         os.makedirs(temp_dir, exist_ok=True)
          if not extract_epub(epub_path, temp_dir):
              cleanup_temp_dir(temp_dir)
              return
@@ -309,9 +374,8 @@ def main():
     finally:
         all_completed = all(status == "completed" for status in translation_status.values())
         if all_completed and os.path.exists(temp_dir) and os.path.exists(status_file_path):
-            cleanup_temp_dir(temp_dir)
-            os.remove(status_file_path)
-            print(f"Removed translation status file: {status_file_path}")
+            cleanup_temp_dir(temp_dir) # This removes the temp_dir AND its contents, including the status file.
+            print(f"Cleaned up temporary directory: {temp_dir}")
         else:
             print(f"\nTemporary directory '{temp_dir}' and status file '{status_file_path}' preserved for incremental translation (some files may still be 'failed' or 'pending').")
 
