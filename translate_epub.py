@@ -8,6 +8,8 @@ import google.generativeai as genai
 import time
 import argparse
 from google.api_core import exceptions as google_api_exceptions
+import hashlib
+import itertools
 
 # --- Configuration ---
 MODEL_NAME = "gemini-2.0-flash-lite"
@@ -24,72 +26,158 @@ Do **not translate** or modify the input if it meets **any** of the following co
 If the text **does not meet the criteria for confident, accurate translation**, return it **exactly as received**, with **no modifications**, **no formatting**, and **no added or invented content**.
 Do **not include** any introductory text, explanation, or labels. Output only the translated text, or the original text unchanged if translation is not applicable.
 """
-# --- Helper Functions ---
+
+# Global variable to hold the current model instance and API key list
+_current_model = None
+_api_keys = []
+_api_key_iterator = None
 
 def setup_gemini_api(api_key):
     """Sets up the Google Gemini API with the provided key."""
-    if not api_key:
-        print("Error: Gemini API Key is missing. Please provide it via --api_key or set the GOOGLE_API_KEY environment variable.")
-        return False
     try:
         genai.configure(api_key=api_key)
-        print("Gemini API configured successfully.")
+        global _current_model
+        _current_model = genai.GenerativeModel(MODEL_NAME)
+        print(f"Gemini API configured successfully with key: {api_key[:5]}...")
         return True
     except Exception as e:
-        print(f"Error configuring Gemini API: {e}")
+        print(f"Error configuring Gemini API with key {api_key[:5]}...: {e}")
         return False
 
-def translate_text(text_content, model, base_prompt):
+def get_next_api_key_and_setup(is_initial_setup=False):
+    """
+    Cycles to the next API key and sets up the Gemini API.
+    Returns True on success, False if no more keys or all failed *in the current pass*.
+    If is_initial_setup is True, it tries all keys once without strict rate limit handling from translate_text.
+    """
+    global _api_key_iterator
+    global _api_keys
+
+    if not _api_keys:
+        print("Error: No API keys available to cycle through.")
+        return False
+    
+    if _api_key_iterator is None:
+        _api_key_iterator = itertools.cycle(_api_keys)
+
+    # We'll try all keys once in this function call
+    for _ in range(len(_api_keys)):
+        next_key = next(_api_key_iterator)
+        if setup_gemini_api(next_key):
+            return True
+    
+    # If we reached here, it means all keys failed to set up or were rate-limited in this cycle.
+    return False
+
+def is_meaningful_text(text):
+    """
+    Checks if a string is likely meaningful natural language,
+    filtering out lines that are just symbols, numbers, or whitespace.
+    """
+    if not text.strip(): # Check for empty or purely whitespace strings
+        return False
+    
+    # Check if the text consists predominantly of non-alphanumeric characters or digits
+    if re.search(r'[\u4e00-\u9fffA-Za-z]', text):
+        alphanum_chars = sum(c.isalnum() for c in text)
+        total_chars = len(text)
+        # Consider texts with very low alphanumeric content as potentially not meaningful
+        if total_chars > 0 and (alphanum_chars / total_chars) < 0.15: # Adjusted threshold slightly
+            # Additional check for repetitive symbols that might contain a single letter (e.g., "----A----")
+            if re.fullmatch(r'([-\*=/_#\.])+\s*[A-Za-z]?\s*([-\*=/_#\.])+', text.strip()):
+                return False
+            return True
+        return True # If it has enough alphanumeric characters, consider it meaningful
+    
+    # Consider if the text is just repeating patterns of symbols or numbers.
+    if re.fullmatch(r'([-\*=/_#\.])\1+', text.strip()) or re.fullmatch(r'\d[\d\s\.]*', text.strip()):
+        return False
+        
+    return False # Default to false if no meaningful content detected by basic checks
+
+def translate_text(text_content, base_prompt):
     """
     Translates a given text content into Simplified Chinese using the Gemini API.
-    Returns (translated_text, True) on success, (original_text, False) on persistent failure.
-    Includes explicit rate limit handling (waiting).
+    Returns (translated_text, True) on success, (original_text, False) on persistent failure
+    (meaning the translation should be skipped and original content kept).
+    Includes explicit rate limit handling (waiting and API key cycling).
     """
     if not text_content.strip():
-        return "", True # Successfully processed empty text
+        return "", True
+    
+    # Pre-translation Filtering for non-meaningful text:
+    # If the text is deemed not meaningful, return original content immediately.
+    if not is_meaningful_text(text_content):
+        print(f"  Skipping non-meaningful text (pre-filter): {text_content[:70]}{'...' if len(text_content) > 70 else ''}")
+        return text_content, True # Successfully "processed" by returning original
 
     prompt = f"{base_prompt}{text_content}"
-    max_retries = 5 # Increased retries for robustness against rate limits
-    initial_wait_time = 2 # seconds
+    max_retries_per_key = 2 # Retries within the same API key before trying the next one
+    initial_wait_time_on_error = 2 # seconds for general errors
+    wait_time_on_all_keys_exhausted = 60 # seconds to wait when all keys hit rate limit
 
-    for attempt in range(max_retries):
-        try:
-            response = model.generate_content(prompt)
+    global _current_model
+    global _api_keys
 
-            if response and response.text:
-                translated_text = response.text.strip() # Strip whitespace from translation too
-                
-                print(f"  Original: {text_content[:70]}{'...' if len(text_content) > 70 else ''}")
-                print(f"  Translated: {translated_text[:70]}{'...' if len(translated_text) > 70 else ''}\n")
-                return translated_text, True # Return translated text and success flag
-            else:
-                print(f"Attempt {attempt + 1}: No translation found in API response for text: '{text_content[:50]}...'")
-                if attempt < max_retries - 1:
-                    wait_time = initial_wait_time * (2 ** attempt)
-                    print(f"  Waiting {wait_time} seconds before retrying...")
+    # Outer loop to handle persistent rate limits across all keys
+    while True: # Loop indefinitely until translation succeeds or a critical non-rate-limit error occurs
+        if _current_model is None:
+            # Attempt to set up a model if none is active (e.g., first run or previous key failed setup)
+            if not get_next_api_key_and_setup():
+                print("Critical: No active Gemini model available and all keys failed to set up. Cannot translate this segment.")
+                return text_content, False # Cannot proceed at all
+
+        # Inner loop for retries with the current API key
+        for attempt in range(max_retries_per_key):
+            try:
+                response = _current_model.generate_content(prompt)
+
+                if response and response.text:
+                    translated_text = response.text.strip()
+                    print(f"  Original: {text_content[:70]}{'...' if len(text_content) > 70 else ''}")
+                    print(f"  Translated: {translated_text[:70]}{'...' if len(translated_text) > 70 else ''}\n")
+                    return translated_text, True
+                else:
+                    print(f"Attempt {attempt + 1} (current key): No translation found in API response for text: '{text_content[:50]}...'")
+                    if attempt < max_retries_per_key - 1:
+                        wait_time = initial_wait_time_on_error * (2 ** attempt)
+                        print(f"  Waiting {wait_time} seconds before retrying with current key...")
+                        time.sleep(wait_time)
+                    else:
+                        print("  Max retries reached with current key. Trying next API key if available.")
+                        break # Break inner loop, try next API key via outer loop's cycle logic
+            except google_api_exceptions.ResourceExhausted as e:
+                print(f"Attempt {attempt + 1} (current key): Rate limit exceeded for text: '{text_content[:50]}...'")
+                print("  Switching to next API key...")
+                # Try next API key immediately
+                if not get_next_api_key_and_setup():
+                    # All keys are rate-limited. Now, we wait.
+                    print(f"All API keys are currently rate-limited. Waiting {wait_time_on_all_keys_exhausted} seconds before retrying all keys.")
+                    time.sleep(wait_time_on_all_keys_exhausted)
+                    # After waiting, try to get a new key again
+                    continue # Continue the outer loop to retry getting a new key and translation
+                break # Break inner loop, outer loop will continue with new key
+            except Exception as e:
+                print(f"Attempt {attempt + 1} (current key): General API error: {e} for text: '{text_content[:50]}...'")
+                if attempt < max_retries_per_key - 1:
+                    wait_time = initial_wait_time_on_error * (2 ** attempt)
+                    print(f"  Waiting {wait_time} seconds due to error before retrying with current key...")
                     time.sleep(wait_time)
                 else:
-                    print("Max retries reached. Skipping translation for this segment.")
-                    return text_content, False
-        except google_api_exceptions.ResourceExhausted as e:
-            print(f"Attempt {attempt + 1}: Rate limit exceeded for text: '{text_content[:50]}...'")
-            if attempt < max_retries - 1:
-                wait_time = initial_wait_time * (2 ** attempt)
-                print(f"  Waiting {wait_time} seconds due to rate limit before retrying...")
-                time.sleep(wait_time)
-            else:
-                print("Max retries reached due to persistent rate limits. Skipping translation for this segment.")
-                return text_content, False
-        except Exception as e:
-            print(f"Attempt {attempt + 1}: General API error: {e} for text: '{text_content[:50]}...'")
-            if attempt < max_retries - 1:
-                wait_time = initial_wait_time * (2 ** attempt)
-                print(f"  Waiting {wait_time} seconds due to error before retrying...")
-                time.sleep(wait_time)
-            else:
-                print(f"Max retries reached due to persistent API errors. Skipping translation for this segment.")
-                return text_content, False
-    return text_content, False
+                    print("  Max retries reached with current key due to errors. Trying next API key if available.")
+                    # If general errors persist with current key, try next key.
+                    # If this fails to set up a new key, it will eventually fall into the 'all keys rate-limited' logic or critical error.
+                    if not get_next_api_key_and_setup():
+                        print(f"Critical: All API keys exhausted or failed during general errors. Cannot translate: '{text_content[:50]}...'")
+                        return text_content, False # Critical failure, return original
+                    break # Break inner loop, outer loop will continue with new key
+        
+        # If inner loop finished without returning (meaning max retries per key reached or switched key)
+        # and we are still in the outer loop, it implies we need to try next key or wait.
+        # The 'continue' in the ResourceExhausted block handles the waiting.
+        # If we broke from inner loop due to max_retries_per_key and successfully got new key,
+        # the outer loop will just continue with the new key.
+        pass # This pass is just to make the while True loop explicit.
 
 def extract_epub(epub_path, extract_to_dir):
     """Extracts the contents of an EPUB file."""
@@ -111,29 +199,32 @@ def find_html_files(directory):
                 html_files.append(os.path.join(root, file))
     return html_files
 
-def translate_html_file(file_path, model, base_prompt, translation_status_dict):
+def translate_html_file(file_path, base_prompt, translation_status_dict, translation_cache):
     """
     Reads an HTML file, translates its text content, and writes the modified content back.
     Updates the translation_status_dict based on success/failure within the file.
+    Includes logic to use and update the translation_cache for sentence-level progress.
     """
     file_had_errors = False
+    file_relative_path = os.path.relpath(file_path, os.path.commonpath([file_path, os.path.dirname(file_path)]))
+
+    if file_relative_path not in translation_cache:
+        translation_cache[file_relative_path] = {}
+
     try:
-        # Read file in binary mode to preserve encoding and potential BOM
         with open(file_path, 'rb') as f:
             content_bytes = f.read()
 
-        # Determine parser based on lxml availability. No specific .xhtml vs .html handling.
-        parser_name = 'html.parser' # Default fallback parser
+        parser_name = 'html.parser'
         try:
-            import lxml # Try to import lxml
-            parser_name = 'lxml' # Use lxml for general HTML parsing
+            import lxml
+            parser_name = 'lxml'
         except ImportError:
-            pass # lxml not installed, stick to html.parser
+            pass
 
         try:
             soup = BeautifulSoup(content_bytes, parser_name)
         except Exception as e:
-            # If the chosen parser fails, try html.parser as a last resort
             print(f"Error parsing {os.path.basename(file_path)} with '{parser_name}': {e}. Attempting with 'html.parser'.")
             try:
                 soup = BeautifulSoup(content_bytes, 'html.parser')
@@ -142,22 +233,28 @@ def translate_html_file(file_path, model, base_prompt, translation_status_dict):
                 translation_status_dict[file_path] = "failed"
                 return False
 
-
         for text_node in soup.find_all(string=True):
-            # Exclude script, style, title, meta, link, head, noscript, code tags
             if text_node.parent.name not in ['script', 'style', 'title', 'meta', 'link', 'head', 'noscript', 'code']:
                 original_text = str(text_node).strip()
                 
-                # No advanced content filtering (e.g., for XML declarations, numbers) here
-                # All text will be sent to API, relying on model to handle it based on prompt
-                if original_text: # Ensure it's not empty after stripping
-                    translated_text, success = translate_text(original_text, model, base_prompt)
-                    if not success:
-                        file_had_errors = True
+                if original_text:
+                    text_hash = hashlib.sha256(original_text.encode('utf-8')).hexdigest()
+
+                    if text_hash in translation_cache[file_relative_path]:
+                        translated_text = translation_cache[file_relative_path][text_hash]
+                        print(f"  Reusing cached translation for: {original_text[:70]}{'...' if len(original_text) > 70 else ''}")
+                        print(f"  Cached: {translated_text[:70]}{'...' if len(translated_text) > 70 else ''}\n")
+                    else:
+                        translated_text, success = translate_text(original_text, base_prompt)
+                        if not success:
+                            file_had_errors = True
+                        
+                        if translated_text:
+                            translation_cache[file_relative_path][text_hash] = translated_text
+
                     if translated_text:
                         text_node.replace_with(translated_text)
 
-        # Write file in binary mode with explicit UTF-8 encoding
         with open(file_path, 'wb') as f:
             f.write(soup.encode('utf-8'))
 
@@ -214,8 +311,9 @@ def main():
         help="Path to the EPUB file to be translated."
     )
     parser.add_argument(
-        "--api_key",
-        help="Your Google Gemini API Key. Will be used if provided, otherwise GOOGLE_API_KEY environment variable is checked."
+        "--api_keys",
+        nargs='+',
+        help="One or more Google Gemini API Keys, separated by spaces. E.g., --api_keys KEY1 KEY2 KEY3. Will be used in a loop."
     )
     parser.add_argument(
         "--output_dir",
@@ -233,17 +331,28 @@ def main():
 
     args = parser.parse_args()
 
-    # Determine the API Key: prioritize argument, then environment variable
-    api_key_to_use = args.api_key
-    if not api_key_to_use:
-        api_key_to_use = os.getenv("GOOGLE_API_KEY")
-        if api_key_to_use:
+    global _api_keys
+    if args.api_keys:
+        _api_keys = args.api_keys
+        print(f"Using {len(_api_keys)} API Key(s) from command line arguments.")
+    else:
+        env_api_key = os.getenv("GOOGLE_API_KEY")
+        if env_api_key:
+            _api_keys = [env_api_key]
             print("Using API Key from GOOGLE_API_KEY environment variable.")
         else:
-            print("Error: No API Key provided. Please use --api_key or set GOOGLE_API_KEY environment variable.")
+            print("Error: No API Key(s) provided. Please use --api_keys KEY1 KEY2... or set GOOGLE_API_KEY environment variable.")
             return
+    
+    if not _api_keys:
+        print("Error: No valid API keys found. Exiting.")
+        return
 
-    # Determine the translation prompt
+    # Initial API setup attempt
+    if not get_next_api_key_and_setup(is_initial_setup=True): # Use is_initial_setup flag
+        print("Failed to set up any Gemini API key initially. Please check your keys or network. Exiting.")
+        return
+
     translation_base_prompt = DEFAULT_TRANSLATION_PROMPT
     if args.prompt_file:
         try:
@@ -261,7 +370,6 @@ def main():
     else:
         print("Using default translation prompt.")
 
-    # Validate EPUB file path
     epub_path = os.path.abspath(args.epub_file_path)
     if not os.path.exists(epub_path):
         print(f"Error: EPUB file not found at '{epub_path}'")
@@ -270,16 +378,9 @@ def main():
         print(f"Error: The provided file '{epub_path}' does not appear to be an EPUB file.")
         return
 
-    # Setup API
-    if not setup_gemini_api(api_key_to_use):
-        return
-
-    model = genai.GenerativeModel(MODEL_NAME)
-
     epub_filename = os.path.basename(epub_path)
     epub_name_without_ext = os.path.splitext(epub_filename)[0]
 
-    # Determine temporary directory path
     if args.temp_dir:
         temp_dir = os.path.abspath(args.temp_dir)
         print(f"Using specified temporary directory: {temp_dir}")
@@ -289,22 +390,36 @@ def main():
 
     output_epub_filename = f"{epub_name_without_ext}_zh-Hans.epub"
     output_epub_path = os.path.join(os.path.abspath(args.output_dir), output_epub_filename)
-    # Status file is now always inside the temp_dir
-    status_file_path = os.path.join(temp_dir, f'{epub_name_without_ext}_translation_status.json')
+    
+    status_file_path = os.path.join(temp_dir, f'{epub_name_without_ext}_file_status.json')
+    cache_file_path = os.path.join(temp_dir, f'{epub_name_without_ext}_translation_cache.json')
 
-    os.makedirs(os.path.abspath(args.output_dir), exist_ok=True) # Ensure output dir exists
-    os.makedirs(temp_dir, exist_ok=True) # Ensure temp_dir exists
+    os.makedirs(os.path.abspath(args.output_dir), exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
 
     translation_status = {}
+    translation_cache = {}
+
     if os.path.exists(status_file_path):
         try:
             with open(status_file_path, 'r', encoding='utf-8') as f:
                 translation_status = json.load(f)
-            print(f"Loaded previous translation status from: {status_file_path}")
+            print(f"Loaded previous file-level translation status from: {status_file_path}")
         except json.JSONDecodeError:
-            print(f"Warning: Could not read translation status file '{status_file_path}'. Starting fresh for this EPUB.")
+            print(f"Warning: Could not read file-level translation status file '{status_file_path}'. Starting fresh for this EPUB.")
         except Exception as e:
-            print(f"Warning: Error loading translation status: {e}. Starting fresh for this EPUB.")
+            print(f"Warning: Error loading file-level translation status: {e}. Starting fresh for this EPUB.")
+    
+    if os.path.exists(cache_file_path):
+        try:
+            with open(cache_file_path, 'r', encoding='utf-8') as f:
+                translation_cache = json.load(f)
+            print(f"Loaded previous sentence-level translation cache from: {cache_file_path}")
+        except json.JSONDecodeError:
+            print(f"Warning: Could not read sentence-level translation cache file '{cache_file_path}'. Starting fresh for this EPUB.")
+        except Exception as e:
+            print(f"Warning: Error loading sentence-level translation cache: {e}. Starting fresh for this EPUB.")
+
 
     print(f"\n--- Starting EPUB Translation for '{epub_filename}' ---")
     print(f"Using model: {MODEL_NAME}")
@@ -340,11 +455,14 @@ def main():
                 continue
 
             print(f"\n--- Translating file {i+1}/{len(html_files)}: {os.path.basename(html_file_abs_path)} --- (Status: {current_file_status})")
-            if translate_html_file(html_file_abs_path, model, translation_base_prompt, translation_status):
+            if translate_html_file(html_file_abs_path, translation_base_prompt, translation_status, translation_cache):
                 reprocessed_files_count += 1
             
             with open(status_file_path, 'w', encoding='utf-8') as f:
                 json.dump(translation_status, f, indent=4)
+            
+            with open(cache_file_path, 'w', encoding='utf-8') as f:
+                json.dump(translation_cache, f, indent=4, ensure_ascii=False)
 
         print(f"\nProcessed {reprocessed_files_count} files, skipped {skipped_files_count} already completed files.")
 
@@ -355,11 +473,11 @@ def main():
 
     finally:
         all_completed = all(status == "completed" for status in translation_status.values())
-        if all_completed and os.path.exists(temp_dir) and os.path.exists(status_file_path):
-            cleanup_temp_dir(temp_dir) # This removes the temp_dir AND its contents, including the status file.
+        if all_completed and os.path.exists(temp_dir) and os.path.exists(status_file_path) and os.path.exists(cache_file_path):
+            cleanup_temp_dir(temp_dir)
             print(f"Cleaned up temporary directory: {temp_dir}")
         else:
-            print(f"\nTemporary directory '{temp_dir}' and status file '{status_file_path}' preserved for incremental translation (some files may still be 'failed' or 'pending').")
+            print(f"\nTemporary directory '{temp_dir}', file status '{status_file_path}', and sentence cache '{cache_file_path}' preserved for incremental translation (some files may still be 'failed' or 'pending').")
 
         print("\n--- Translation Process Finished ---")
 
