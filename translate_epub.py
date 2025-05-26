@@ -101,14 +101,15 @@ def is_meaningful_text(text):
     if not text.strip(): # Check for empty or purely whitespace strings
         return False
     
-    # Check if the text consists predominantly of non-alphanumeric characters or digits
-    if re.search(r'[\u4e00-\u9fffA-Za-z]', text):
-        alphanum_chars = sum(c.isalnum() for c in text)
+    # Check if the text consists predominantly of non-alphanumeric characters or digits, including Cyrillic
+    # The regex now includes \u0400-\u04ff for Cyrillic characters.
+    if re.search(r'[\u4e00-\u9fffA-Za-z\u0400-\u04ff]', text): 
+        alphanum_chars = sum(c.isalnum() or '\u0400' <= c <= '\u04ff' for c in text) # Also count Cyrillic as alphanumeric for this check
         total_chars = len(text)
         # Consider texts with very low alphanumeric content as potentially not meaningful
         if total_chars > 0 and (alphanum_chars / total_chars) < 0.15: # Adjusted threshold slightly
             # Additional check for repetitive symbols that might contain a single letter (e.g., "----A----")
-            if re.fullmatch(r'([-\*=/_#\.])+\s*[A-Za-z]?\s*([-\*=/_#\.])+', text.strip()):
+            if re.fullmatch(r'([-\*=/_#\.])+\s*[A-Za-z\u0400-\u04ff]?\s*([-\*=/_#\.])+', text.strip()): # Include Cyrillic here too
                 return False
             return True
         return True # If it has enough alphanumeric characters, consider it meaningful
