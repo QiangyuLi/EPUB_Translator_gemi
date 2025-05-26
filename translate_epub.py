@@ -12,7 +12,16 @@ import hashlib
 import itertools
 
 # --- Configuration ---
-MODEL_NAME = "gemini-2.0-flash-lite"
+# Define a list of models to cycle through based on the provided names
+MODELS = [
+    {"name": "models/gemini-1.5-flash-latest"},
+    {"name": "models/gemini-1.5-pro-latest"},
+    {"name": "models/gemini-1.5-flash-002"},
+    {"name": "models/gemini-1.5-pro-002"},
+    {"name": "models/gemini-1.5-flash-8b-latest"},
+    {"name": "models/gemini-2.5-pro-preview-05-06"},
+    {"name": "models/gemini-2.5-flash-preview-05-20"}
+]
 
 # Reverted to a simpler, less restrictive default translation prompt.
 DEFAULT_TRANSLATION_PROMPT = """
@@ -27,46 +36,61 @@ If the text **does not meet the criteria for confident, accurate translation**, 
 Do **not include** any introductory text, explanation, or labels. Output only the translated text, or the original text unchanged if translation is not applicable.
 """
 
-# Global variable to hold the current model instance and API key list
-_current_model = None
+# Global variables
+_current_model_instance = None
+_current_model_name = None
 _api_keys = []
 _api_key_iterator = None
+_model_iterator = None
 
-def setup_gemini_api(api_key):
-    """Sets up the Google Gemini API with the provided key."""
+def setup_gemini_api(api_key, model_name):
+    """Sets up the Google Gemini API with the provided key and model name."""
     try:
         genai.configure(api_key=api_key)
-        global _current_model
-        _current_model = genai.GenerativeModel(MODEL_NAME)
-        print(f"Gemini API configured successfully with key: {api_key[:5]}...")
+        global _current_model_instance
+        global _current_model_name
+        _current_model_instance = genai.GenerativeModel(model_name)
+        _current_model_name = model_name
+        print(f"Gemini API configured successfully with key: {api_key[:5]}... and model: {model_name}")
         return True
     except Exception as e:
-        print(f"Error configuring Gemini API with key {api_key[:5]}...: {e}")
+        print(f"Error configuring Gemini API with key {api_key[:5]}... and model {model_name}: {e}")
         return False
 
-def get_next_api_key_and_setup(is_initial_setup=False):
+def get_next_api_key_and_model_and_setup(is_initial_setup=False):
     """
-    Cycles to the next API key and sets up the Gemini API.
-    Returns True on success, False if no more keys or all failed *in the current pass*.
-    If is_initial_setup is True, it tries all keys once without strict rate limit handling from translate_text.
+    Cycles to the next API key and model, and sets up the Gemini API.
+    Returns True on success, False if no more combinations of keys/models or all failed.
     """
     global _api_key_iterator
+    global _model_iterator
     global _api_keys
+    global MODELS
 
     if not _api_keys:
         print("Error: No API keys available to cycle through.")
         return False
+    if not MODELS:
+        print("Error: No models configured to cycle through.")
+        return False
     
     if _api_key_iterator is None:
         _api_key_iterator = itertools.cycle(_api_keys)
+    if _model_iterator is None:
+        _model_iterator = itertools.cycle(MODELS)
 
-    # We'll try all keys once in this function call
-    for _ in range(len(_api_keys)):
+    # We'll try all combinations of keys and models once in this function call
+    # This might be less efficient if you want to exhaust all attempts with one key/model first,
+    # but it ensures cycling through all options.
+    for _ in range(len(_api_keys) * len(MODELS)):
         next_key = next(_api_key_iterator)
-        if setup_gemini_api(next_key):
+        next_model_config = next(_model_iterator)
+        next_model_name = next_model_config["name"]
+
+        if setup_gemini_api(next_key, next_model_name):
             return True
     
-    # If we reached here, it means all keys failed to set up or were rate-limited in this cycle.
+    # If we reached here, it means all key-model combinations failed.
     return False
 
 def is_meaningful_text(text):
@@ -100,7 +124,7 @@ def translate_text(text_content, base_prompt):
     Translates a given text content into Simplified Chinese using the Gemini API.
     Returns (translated_text, True) on success, (original_text, False) on persistent failure
     (meaning the translation should be skipped and original content kept).
-    Includes explicit rate limit handling (waiting and API key cycling).
+    Includes explicit rate limit handling (waiting and API key/model cycling).
     """
     if not text_content.strip():
         return "", True
@@ -112,25 +136,25 @@ def translate_text(text_content, base_prompt):
         return text_content, True # Successfully "processed" by returning original
 
     prompt = f"{base_prompt}{text_content}"
-    max_retries_per_key = 2 # Retries within the same API key before trying the next one
+    max_retries_per_combination = 2 # Retries within the same API key and model before trying the next combination
     initial_wait_time_on_error = 2 # seconds for general errors
-    wait_time_on_all_keys_exhausted = 60 # seconds to wait when all keys hit rate limit
+    wait_time_on_all_combinations_exhausted = 60 # seconds to wait when all key-model combinations hit rate limit
 
-    global _current_model
+    global _current_model_instance
     global _api_keys
 
-    # Outer loop to handle persistent rate limits across all keys
+    # Outer loop to handle persistent rate limits across all keys/models
     while True: # Loop indefinitely until translation succeeds or a critical non-rate-limit error occurs
-        if _current_model is None:
-            # Attempt to set up a model if none is active (e.g., first run or previous key failed setup)
-            if not get_next_api_key_and_setup():
-                print("Critical: No active Gemini model available and all keys failed to set up. Cannot translate this segment.")
+        if _current_model_instance is None:
+            # Attempt to set up a model if none is active (e.g., first run or previous combination failed setup)
+            if not get_next_api_key_and_model_and_setup():
+                print("Critical: No active Gemini model/key combination available and all failed to set up. Cannot translate this segment.")
                 return text_content, False # Cannot proceed at all
 
-        # Inner loop for retries with the current API key
-        for attempt in range(max_retries_per_key):
+        # Inner loop for retries with the current API key and model
+        for attempt in range(max_retries_per_combination):
             try:
-                response = _current_model.generate_content(prompt)
+                response = _current_model_instance.generate_content(prompt)
 
                 if response and response.text:
                     translated_text = response.text.strip()
@@ -138,45 +162,41 @@ def translate_text(text_content, base_prompt):
                     print(f"  Translated: {translated_text[:70]}{'...' if len(translated_text) > 70 else ''}\n")
                     return translated_text, True
                 else:
-                    print(f"Attempt {attempt + 1} (current key): No translation found in API response for text: '{text_content[:50]}...'")
-                    if attempt < max_retries_per_key - 1:
+                    print(f"Attempt {attempt + 1} (current combination): No translation found in API response for text: '{text_content[:50]}...'")
+                    if attempt < max_retries_per_combination - 1:
                         wait_time = initial_wait_time_on_error * (2 ** attempt)
-                        print(f"  Waiting {wait_time} seconds before retrying with current key...")
+                        print(f"  Waiting {wait_time} seconds before retrying with current combination...")
                         time.sleep(wait_time)
                     else:
-                        print("  Max retries reached with current key. Trying next API key if available.")
-                        break # Break inner loop, try next API key via outer loop's cycle logic
+                        print("  Max retries reached with current combination. Trying next API key/model if available.")
+                        break # Break inner loop, try next API key/model via outer loop's cycle logic
             except google_api_exceptions.ResourceExhausted as e:
-                print(f"Attempt {attempt + 1} (current key): Rate limit exceeded for text: '{text_content[:50]}...'")
-                print("  Switching to next API key...")
-                # Try next API key immediately
-                if not get_next_api_key_and_setup():
-                    # All keys are rate-limited. Now, we wait.
-                    print(f"All API keys are currently rate-limited. Waiting {wait_time_on_all_keys_exhausted} seconds before retrying all keys.")
-                    time.sleep(wait_time_on_all_keys_exhausted)
-                    # After waiting, try to get a new key again
-                    continue # Continue the outer loop to retry getting a new key and translation
-                break # Break inner loop, outer loop will continue with new key
+                print(f"Attempt {attempt + 1} (current combination): Rate limit exceeded for text: '{text_content[:50]}...'")
+                print("  Switching to next API key/model combination...")
+                # Try next API key/model immediately
+                if not get_next_api_key_and_model_and_setup():
+                    # All combinations are rate-limited. Now, we wait.
+                    print(f"All API key/model combinations are currently rate-limited. Waiting {wait_time_on_all_combinations_exhausted} seconds before retrying all.")
+                    time.sleep(wait_time_on_all_combinations_exhausted)
+                    # After waiting, try to get a new combination again
+                    continue # Continue the outer loop to retry getting a new combination and translation
+                break # Break inner loop, outer loop will continue with new combination
             except Exception as e:
-                print(f"Attempt {attempt + 1} (current key): General API error: {e} for text: '{text_content[:50]}...'")
-                if attempt < max_retries_per_key - 1:
+                print(f"Attempt {attempt + 1} (current combination): General API error: {e} for text: '{text_content[:50]}...'")
+                if attempt < max_retries_per_combination - 1:
                     wait_time = initial_wait_time_on_error * (2 ** attempt)
-                    print(f"  Waiting {wait_time} seconds due to error before retrying with current key...")
+                    print(f"  Waiting {wait_time} seconds due to error before retrying with current combination...")
                     time.sleep(wait_time)
                 else:
-                    print("  Max retries reached with current key due to errors. Trying next API key if available.")
-                    # If general errors persist with current key, try next key.
-                    # If this fails to set up a new key, it will eventually fall into the 'all keys rate-limited' logic or critical error.
-                    if not get_next_api_key_and_setup():
-                        print(f"Critical: All API keys exhausted or failed during general errors. Cannot translate: '{text_content[:50]}...'")
+                    print("  Max retries reached with current combination due to errors. Trying next API key/model if available.")
+                    # If general errors persist with current combination, try next.
+                    if not get_next_api_key_and_model_and_setup():
+                        print(f"Critical: All API key/model combinations exhausted or failed during general errors. Cannot translate: '{text_content[:50]}...'")
                         return text_content, False # Critical failure, return original
-                    break # Break inner loop, outer loop will continue with new key
+                    break # Break inner loop, outer loop will continue with new combination
         
-        # If inner loop finished without returning (meaning max retries per key reached or switched key)
-        # and we are still in the outer loop, it implies we need to try next key or wait.
-        # The 'continue' in the ResourceExhausted block handles the waiting.
-        # If we broke from inner loop due to max_retries_per_key and successfully got new key,
-        # the outer loop will just continue with the new key.
+        # If inner loop finished without returning (meaning max retries per combination reached or switched combination)
+        # and we are still in the outer loop, it implies we need to try next combination or wait.
         pass # This pass is just to make the while True loop explicit.
 
 def extract_epub(epub_path, extract_to_dir):
@@ -348,9 +368,9 @@ def main():
         print("Error: No valid API keys found. Exiting.")
         return
 
-    # Initial API setup attempt
-    if not get_next_api_key_and_setup(is_initial_setup=True): # Use is_initial_setup flag
-        print("Failed to set up any Gemini API key initially. Please check your keys or network. Exiting.")
+    # Initial API setup attempt with first API key and model
+    if not get_next_api_key_and_model_and_setup(is_initial_setup=True):
+        print("Failed to set up any Gemini API key/model combination initially. Please check your keys or network. Exiting.")
         return
 
     translation_base_prompt = DEFAULT_TRANSLATION_PROMPT
@@ -422,7 +442,7 @@ def main():
 
 
     print(f"\n--- Starting EPUB Translation for '{epub_filename}' ---")
-    print(f"Using model: {MODEL_NAME}")
+    print(f"Using model: {_current_model_name}")
     print(f"Temporary directory: {temp_dir}")
     print(f"Output EPUB will be saved to: {output_epub_path}")
 
