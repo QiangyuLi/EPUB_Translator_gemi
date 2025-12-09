@@ -10,316 +10,414 @@ import argparse
 from google.api_core import exceptions as google_api_exceptions
 import hashlib
 import itertools
+from pathlib import Path
 
 # --- Configuration ---
-# Define a list of models to cycle through based on the provided names
+
+# Prioritize the most current and powerful models for general use.
 MODELS = [
+    {"name": "models/gemini-2.5-flash"},
+    {"name": "models/gemini-2.5-pro"},
     {"name": "models/gemini-1.5-flash-latest"},
-    {"name": "models/gemini-1.5-pro-latest"},
-    {"name": "models/gemini-1.5-flash-002"},
-    {"name": "models/gemini-1.5-pro-002"},
-    {"name": "models/gemini-1.5-flash-8b-latest"},
-    {"name": "models/gemini-2.5-pro-preview-05-06"},
-    {"name": "models/gemini-2.5-flash-preview-05-20"}
+    {"name": "models/gemini-1.5-pro-latest"}
 ]
 
-# Reverted to a simpler, less restrictive default translation prompt.
+# Refined default prompt for clarity and strict adherence to rules.
 DEFAULT_TRANSLATION_PROMPT = """
-Translate the following content into Simplified Chinese **only if the text clearly consists of meaningful, natural language** — such as full sentences, phrases, documentation, or conversational content.
-Do **not translate** or modify the input if it meets **any** of the following conditions:
-- It is structured content such as XML, HTML, JSON, or programming code.
-- It contains markup, configuration, commands, paths, keys, tags, or variable names.
-- It is composed only of symbols, placeholders, punctuation (e.g., ——— or ***), or lacks any semantic meaning.
-- It is an isolated number, acronym, abbreviation, or Roman numeral without context.
-- It is ambiguous or contextless and cannot be reliably identified as human language.
-If the text **does not meet the criteria for confident, accurate translation**, return it **exactly as received**, with **no modifications**, **no formatting**, and **no added or invented content**.
-Do **not include** any introductory text, explanation, or labels. Output only the translated text, or the original text unchanged if translation is not applicable.
+You are an expert translator. Your task is to translate the following content into **Simplified Chinese**.
+
+**STRICT RULES:**
+1. Translate the text **only if** it is meaningful, natural language content (sentences, paragraphs, phrases, or conversational text).
+2. **DO NOT** translate or modify the input if it contains: structured content (XML, HTML, JSON), programming code, configuration, file paths, variable names, or consists only of symbols (e.g., `---`, `*`), isolated numbers, acronyms, or Roman numerals without context.
+3. If translation is not applicable based on the rules, return the input text **EXACTLY AS RECEIVED** with **no modifications**, **no formatting**, and **no added or invented content**.
+4. Do not include any introductory text, explanations, or labels. Output ONLY the translated text, or the original text unchanged if translation is not applicable.
 """
 
-# Global variables
-_current_model_instance = None
-_current_model_name = None
-_api_keys = []
-_api_key_iterator = None
-_model_iterator = None
-
-def setup_gemini_api(api_key, model_name):
-    """Sets up the Google Gemini API with the provided key and model name."""
-    try:
-        genai.configure(api_key=api_key)
-        global _current_model_instance
-        global _current_model_name
-        _current_model_instance = genai.GenerativeModel(model_name)
-        _current_model_name = model_name
-        print(f"Gemini API configured successfully with key: {api_key[:5]}... and model: {model_name}")
-        return True
-    except Exception as e:
-        print(f"Error configuring Gemini API with key {api_key[:5]}... and model {model_name}: {e}")
-        return False
-
-def get_next_api_key_and_model_and_setup(is_initial_setup=False):
+class GeminiEPUBTranslator:
     """
-    Cycles to the next API key and model, and sets up the Gemini API.
-    Returns True on success, False if no more combinations of keys/models or all failed.
+    Handles EPUB extraction, HTML parsing, and robust, incremental translation
+    using the Google Gemini API with key/model cycling and caching.
     """
-    global _api_key_iterator
-    global _model_iterator
-    global _api_keys
-    global MODELS
+    def __init__(self, api_keys, models, base_prompt):
+        if not api_keys:
+            raise ValueError("API keys list cannot be empty.")
+        if not models:
+            raise ValueError("Models list cannot be empty.")
 
-    if not _api_keys:
-        print("Error: No API keys available to cycle through.")
-        return False
-    if not MODELS:
-        print("Error: No models configured to cycle through.")
-        return False
-    
-    if _api_key_iterator is None:
-        _api_key_iterator = itertools.cycle(_api_keys)
-    if _model_iterator is None:
-        _model_iterator = itertools.cycle(MODELS)
-
-    # We'll try all combinations of keys and models once in this function call
-    # This might be less efficient if you want to exhaust all attempts with one key/model first,
-    # but it ensures cycling through all options.
-    for _ in range(len(_api_keys) * len(MODELS)):
-        next_key = next(_api_key_iterator)
-        next_model_config = next(_model_iterator)
-        next_model_name = next_model_config["name"]
-
-        if setup_gemini_api(next_key, next_model_name):
-            return True
-    
-    # If we reached here, it means all key-model combinations failed.
-    return False
-
-def is_meaningful_text(text):
-    """
-    Checks if a string is likely meaningful natural language,
-    filtering out lines that are just symbols, numbers, or whitespace.
-    """
-    if not text.strip(): # Check for empty or purely whitespace strings
-        return False
-    
-    # Check if the text consists predominantly of non-alphanumeric characters or digits, including Cyrillic
-    # The regex now includes \u0400-\u04ff for Cyrillic characters.
-    if re.search(r'[\u4e00-\u9fffA-Za-z\u0400-\u04ff]', text): 
-        alphanum_chars = sum(c.isalnum() or '\u0400' <= c <= '\u04ff' for c in text) # Also count Cyrillic as alphanumeric for this check
-        total_chars = len(text)
-        # Consider texts with very low alphanumeric content as potentially not meaningful
-        if total_chars > 0 and (alphanum_chars / total_chars) < 0.15: # Adjusted threshold slightly
-            # Additional check for repetitive symbols that might contain a single letter (e.g., "----A----")
-            if re.fullmatch(r'([-\*=/_#\.])+\s*[A-Za-z\u0400-\u04ff]?\s*([-\*=/_#\.])+', text.strip()): # Include Cyrillic here too
-                return False
-            return True
-        return True # If it has enough alphanumeric characters, consider it meaningful
-    
-    # Consider if the text is just repeating patterns of symbols or numbers.
-    if re.fullmatch(r'([-\*=/_#\.])\1+', text.strip()) or re.fullmatch(r'\d[\d\s\.]*', text.strip()):
-        return False
+        # Cyclical iterators for API keys and models
+        self.api_key_iterator = itertools.cycle(api_keys)
+        self.model_iterator = itertools.cycle(models)
+        self.api_keys = api_keys
+        self.models = models
         
-    return False # Default to false if no meaningful content detected by basic checks
+        # Current active configuration
+        self.client = None
+        self.model_name = None
+        self.base_prompt = base_prompt
+        self.max_retries_per_combination = 3
+        self.initial_wait_time_on_error = 2 # seconds
+        self.wait_time_on_all_combinations_exhausted = 60 # seconds
 
-def translate_text(text_content, base_prompt):
-    """
-    Translates a given text content into Simplified Chinese using the Gemini API.
-    Returns (translated_text, True) on success, (original_text, False) on persistent failure
-    (meaning the translation should be skipped and original content kept).
-    Includes explicit rate limit handling (waiting and API key/model cycling).
-    """
-    if not text_content.strip():
-        return "", True
-    
-    # Pre-translation Filtering for non-meaningful text:
-    # If the text is deemed not meaningful, return original content immediately.
-    if not is_meaningful_text(text_content):
-        print(f"  Skipping non-meaningful text (pre-filter): {text_content[:70]}{'...' if len(text_content) > 70 else ''}")
-        return text_content, True # Successfully "processed" by returning original
-
-    prompt = f"{base_prompt}{text_content}"
-    max_retries_per_combination = 2 # Retries within the same API key and model before trying the next combination
-    initial_wait_time_on_error = 2 # seconds for general errors
-    wait_time_on_all_combinations_exhausted = 60 # seconds to wait when all key-model combinations hit rate limit
-
-    global _current_model_instance
-    global _api_keys
-
-    # Outer loop to handle persistent rate limits across all keys/models
-    while True: # Loop indefinitely until translation succeeds or a critical non-rate-limit error occurs
-        if _current_model_instance is None:
-            # Attempt to set up a model if none is active (e.g., first run or previous combination failed setup)
-            if not get_next_api_key_and_model_and_setup():
-                print("Critical: No active Gemini model/key combination available and all failed to set up. Cannot translate this segment.")
-                return text_content, False # Cannot proceed at all
-
-        # Inner loop for retries with the current API key and model
-        for attempt in range(max_retries_per_combination):
-            try:
-                response = _current_model_instance.generate_content(prompt)
-
-                if response and response.text:
-                    translated_text = response.text.strip()
-                    print(f"  Original: {text_content[:70]}{'...' if len(text_content) > 70 else ''}")
-                    print(f"  Translated: {translated_text[:70]}{'...' if len(translated_text) > 70 else ''}\n")
-                    return translated_text, True
-                else:
-                    print(f"Attempt {attempt + 1} (current combination): No translation found in API response for text: '{text_content[:50]}...'")
-                    if attempt < max_retries_per_combination - 1:
-                        wait_time = initial_wait_time_on_error * (2 ** attempt)
-                        print(f"  Waiting {wait_time} seconds before retrying with current combination...")
-                        time.sleep(wait_time)
-                    else:
-                        print("  Max retries reached with current combination. Trying next API key/model if available.")
-                        break # Break inner loop, try next API key/model via outer loop's cycle logic
-            except google_api_exceptions.ResourceExhausted as e:
-                print(f"Attempt {attempt + 1} (current combination): Rate limit exceeded for text: '{text_content[:50]}...'")
-                print("  Switching to next API key/model combination...")
-                # Try next API key/model immediately
-                if not get_next_api_key_and_model_and_setup():
-                    # All combinations are rate-limited. Now, we wait.
-                    print(f"All API key/model combinations are currently rate-limited. Waiting {wait_time_on_all_combinations_exhausted} seconds before retrying all.")
-                    time.sleep(wait_time_on_all_combinations_exhausted)
-                    # After waiting, try to get a new combination again
-                    continue # Continue the outer loop to retry getting a new combination and translation
-                break # Break inner loop, outer loop will continue with new combination
-            except Exception as e:
-                print(f"Attempt {attempt + 1} (current combination): General API error: {e} for text: '{text_content[:50]}...'")
-                if attempt < max_retries_per_combination - 1:
-                    wait_time = initial_wait_time_on_error * (2 ** attempt)
-                    print(f"  Waiting {wait_time} seconds due to error before retrying with current combination...")
-                    time.sleep(wait_time)
-                else:
-                    print("  Max retries reached with current combination due to errors. Trying next API key/model if available.")
-                    # If general errors persist with current combination, try next.
-                    if not get_next_api_key_and_model_and_setup():
-                        print(f"Critical: All API key/model combinations exhausted or failed during general errors. Cannot translate: '{text_content[:50]}...'")
-                        return text_content, False # Critical failure, return original
-                    break # Break inner loop, outer loop will continue with new combination
-        
-        # If inner loop finished without returning (meaning max retries per combination reached or switched combination)
-        # and we are still in the outer loop, it implies we need to try next combination or wait.
-        pass # This pass is just to make the while True loop explicit.
-
-def extract_epub(epub_path, extract_to_dir):
-    """Extracts the contents of an EPUB file."""
-    try:
-        with zipfile.ZipFile(epub_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_to_dir)
-        print(f"EPUB extracted to: {extract_to_dir}")
-        return True
-    except Exception as e:
-        print(f"Error extracting EPUB: {e}")
-        return False
-
-def find_html_files(directory):
-    """Finds all HTML/XHTML files in the extracted EPUB directory."""
-    html_files = []
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.endswith(('.html', '.xhtml', '.htm')):
-                html_files.append(os.path.join(root, file))
-    return html_files
-
-def translate_html_file(file_path, base_prompt, translation_status_dict, translation_cache):
-    """
-    Reads an HTML file, translates its text content, and writes the modified content back.
-    Updates the translation_status_dict based on success/failure within the file.
-    Includes logic to use and update the translation_cache for sentence-level progress.
-    """
-    file_had_errors = False
-    file_relative_path = os.path.relpath(file_path, os.path.commonpath([file_path, os.path.dirname(file_path)]))
-
-    if file_relative_path not in translation_cache:
-        translation_cache[file_relative_path] = {}
-
-    try:
-        with open(file_path, 'rb') as f:
-            content_bytes = f.read()
-
-        parser_name = 'html.parser'
+    def _setup_gemini_api(self, api_key, model_config):
+        """Sets up the Google Gemini API with the provided key and model name."""
+        model_name = model_config["name"]
         try:
-            import lxml
-            parser_name = 'lxml'
-        except ImportError:
-            pass
-
-        try:
-            soup = BeautifulSoup(content_bytes, parser_name)
+            genai.configure(api_key=api_key)
+            self.client = genai.GenerativeModel(model_name)
+            self.model_name = model_name
+            print(f"Gemini API configured: Key: {api_key[:5]}... | Model: {model_name}")
+            return True
         except Exception as e:
-            print(f"Error parsing {os.path.basename(file_path)} with '{parser_name}': {e}. Attempting with 'html.parser'.")
-            try:
-                soup = BeautifulSoup(content_bytes, 'html.parser')
-            except Exception as inner_e:
-                print(f"Critical: Failed to parse {os.path.basename(file_path)} even with 'html.parser': {inner_e}. Skipping file.")
-                translation_status_dict[file_path] = "failed"
-                return False
-
-        for text_node in soup.find_all(string=True):
-            if text_node.parent.name not in ['script', 'style', 'title', 'meta', 'link', 'head', 'noscript', 'code']:
-                original_text = str(text_node).strip()
-                
-                if original_text:
-                    text_hash = hashlib.sha256(original_text.encode('utf-8')).hexdigest()
-
-                    if text_hash in translation_cache[file_relative_path]:
-                        translated_text = translation_cache[file_relative_path][text_hash]
-                        print(f"  Reusing cached translation for: {original_text[:70]}{'...' if len(original_text) > 70 else ''}")
-                        print(f"  Cached: {translated_text[:70]}{'...' if len(translated_text) > 70 else ''}\n")
-                    else:
-                        translated_text, success = translate_text(original_text, base_prompt)
-                        if not success:
-                            file_had_errors = True
-                        
-                        if translated_text:
-                            translation_cache[file_relative_path][text_hash] = translated_text
-
-                    if translated_text:
-                        text_node.replace_with(translated_text)
-
-        with open(file_path, 'wb') as f:
-            f.write(soup.encode('utf-8'))
-
-        if file_had_errors:
-            translation_status_dict[file_path] = "failed"
-            print(f"Finished processing: {os.path.basename(file_path)} (Some segments failed)\n")
-        else:
-            translation_status_dict[file_path] = "completed"
-            print(f"Finished processing: {os.path.basename(file_path)} (All segments successful)\n")
-        return True
-    except Exception as e:
-        print(f"Critical error processing HTML file {file_path}: {e}")
-        translation_status_dict[file_path] = "failed"
-        return False
-
-def create_translated_epub(source_dir, output_epub_path):
-    """Creates a new EPUB file from the modified contents."""
-    try:
-        mimetype_path = os.path.join(source_dir, 'mimetype')
-        if not os.path.exists(mimetype_path):
-            print("Error: mimetype file not found. Cannot create EPUB.")
+            print(f"Error configuring API with key {api_key[:5]}... and model {model_name}: {e}")
             return False
 
-        with zipfile.ZipFile(output_epub_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.write(mimetype_path, 'mimetype', compress_type=zipfile.ZIP_STORED)
+    def _cycle_to_next_config(self):
+        """
+        Cycles to the next API key and model combination, and sets up the client.
+        Tries all combinations before failing.
+        Returns True on success, False if all combinations failed setup.
+        """
+        # We try up to the total number of combinations to ensure we check every possibility.
+        for _ in range(len(self.api_keys) * len(self.models)):
+            next_key = next(self.api_key_iterator)
+            next_model_config = next(self.model_iterator)
 
-            for root, dirs, files in os.walk(source_dir):
-                for file in files:
-                    if file == 'mimetype':
-                        continue
-                    file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, source_dir)
-                    zf.write(file_path, arcname)
-        print(f"Translated EPUB created at: {output_epub_path}")
-        return True
-    except Exception as e:
-        print(f"Error creating translated EPUB: {e}")
+            if self._setup_gemini_api(next_key, next_model_config):
+                return True
+        
+        # If we reached here, it means all key-model combinations failed.
         return False
+    
+    def _is_meaningful_text(self, text):
+        """
+        Checks if a string is likely meaningful natural language by looking
+        for a ratio of common language characters (letters, CJK, Cyrillic)
+        and filtering out repeating symbols or pure numbers.
+        """
+        stripped_text = text.strip()
+        if not stripped_text:
+            return False
+        
+        # Check for pure number/symbol lines
+        if re.fullmatch(r'[\d\s\.\,\-\+]+', stripped_text):
+            return False
+        
+        # Define characters considered "meaningful" for translation
+        # Includes: Latin, CJK (Chinese/Japanese/Korean), Cyrillic
+        meaningful_chars = re.findall(r'[A-Za-z\u4e00-\u9fff\u0400-\u04ff]', text)
+        
+        # If less than 15% of the characters are meaningful, it's likely not worth translating
+        if len(text) > 5 and len(meaningful_chars) / len(text) < 0.15:
+            return False
+            
+        # Filter repetitive symbols that might contain a single letter (e.g., "----A----")
+        if re.fullmatch(r'([-\*=/_#\.])+\s*[A-Za-z\u4e00-\u9fff\u0400-\u04ff]?\s*([-\*=/_#\.])+', stripped_text):
+            return False
+            
+        return True
 
-def cleanup_temp_dir(temp_dir):
-    """Removes the temporary directory."""
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
-        print(f"Cleaned up temporary directory: {temp_dir}")
+    def _translate_segment_with_retry(self, text_content):
+        """
+        Attempts translation, handling rate limits and general errors by
+        retrying with the current config, then cycling to the next config,
+        and finally pausing if all configurations are exhausted.
+        Returns (translated_text, True) on success, (original_text, False) on persistent failure.
+        """
+        if not text_content.strip():
+            return "", True
+
+        if not self._is_meaningful_text(text_content):
+            print(f"  Skipping non-meaningful text (pre-filter): {text_content[:70]}{'...' if len(text_content) > 70 else ''}")
+            return text_content, True
+
+        prompt = f"{self.base_prompt}\n\n{text_content}"
+        
+        # Total combinations to try before a long wait
+        max_combinations = len(self.api_keys) * len(self.models)
+        
+        # Outer loop to handle key/model cycling
+        for combination_attempt in range(max_combinations):
+            if self.client is None:
+                if not self._cycle_to_next_config():
+                    print("Critical: All initial API key/model combinations failed to set up.")
+                    return text_content, False
+
+            # Inner loop for retries within the current combination
+            for attempt in range(self.max_retries_per_combination):
+                try:
+                    response = self.client.generate_content(prompt)
+                    
+                    if response and response.text:
+                        translated_text = response.text.strip()
+                        print(f"  Original: {text_content[:70]}{'...' if len(text_content) > 70 else ''}")
+                        print(f"  Translated: {translated_text[:70]}{'...' if len(translated_text) > 70 else ''}\n")
+                        return translated_text, True
+                    else:
+                        raise RuntimeError("Empty or invalid API response.")
+
+                except google_api_exceptions.ResourceExhausted:
+                    print(f"Attempt {attempt + 1}: Rate limit exceeded for {self.model_name}. Cycling to next key/model...")
+                    break # Break inner loop, forces combination_attempt increment
+
+                except Exception as e:
+                    print(f"Attempt {attempt + 1}: General API error ({self.model_name}): {e}. Retrying...")
+                    if attempt < self.max_retries_per_combination - 1:
+                        wait_time = self.initial_wait_time_on_error * (2 ** attempt)
+                        time.sleep(wait_time)
+                    else:
+                        print("  Max retries reached with current combination due to errors. Cycling to next key/model...")
+                        break # Break inner loop, forces combination_attempt increment
+            
+            # If the inner loop broke (rate limit or max retries), try to cycle
+            if combination_attempt < max_combinations - 1:
+                # Cycle to the next combination for the next attempt
+                self._cycle_to_next_config()
+                continue
+        
+        # If all combinations have been tried (max_combinations reached), wait and restart
+        print(f"All API key/model combinations exhausted or rate-limited. Waiting {self.wait_time_on_all_combinations_exhausted} seconds before full retry.")
+        time.sleep(self.wait_time_on_all_combinations_exhausted)
+        # Recursive call after waiting. In a real long-running script, this could be risky,
+        # but for this specific failure mode (all rate-limited), it's the intended recovery.
+        # Alternatively, a simple False return here could be safer for critical scripts.
+        return self._translate_segment_with_retry(text_content)
+
+
+    def _extract_epub(self, epub_path, extract_to_dir):
+        """Extracts the contents of an EPUB file."""
+        try:
+            with zipfile.ZipFile(epub_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_to_dir)
+            print(f"EPUB extracted to: {extract_to_dir}")
+            return True
+        except Exception as e:
+            print(f"Error extracting EPUB: {e}")
+            return False
+
+    def _find_html_files(self, directory):
+        """Finds all HTML/XHTML files in the extracted EPUB directory."""
+        return list(directory.glob('**/*.*html'))
+
+    def _translate_html_file(self, file_path, temp_dir, translation_status_dict, translation_cache):
+        """
+        Reads an HTML file, translates its text content, and writes the modified content back.
+        """
+        file_had_errors = False
+        file_relative_path = file_path.relative_to(temp_dir).as_posix()
+
+        if file_relative_path not in translation_cache:
+            translation_cache[file_relative_path] = {}
+
+        try:
+            # Read the file content bytes
+            content_bytes = file_path.read_bytes()
+
+            # Determine the best parser
+            try:
+                import lxml
+                parser_name = 'lxml'
+            except ImportError:
+                parser_name = 'html.parser'
+
+            try:
+                soup = BeautifulSoup(content_bytes, parser_name)
+            except Exception as e:
+                print(f"Error parsing {file_path.name}: {e}. Skipping file.")
+                translation_status_dict[file_relative_path] = "failed"
+                return False
+
+            for text_node in soup.find_all(string=True):
+                # Skip text inside script, style, meta, etc. tags
+                if text_node.parent.name not in ['script', 'style', 'title', 'meta', 'link', 'head', 'noscript', 'code']:
+                    original_text = str(text_node).strip()
+                    
+                    if original_text:
+                        # Use hash for cache lookup
+                        text_hash = hashlib.sha256(original_text.encode('utf-8')).hexdigest()
+                        
+                        translated_text = None
+                        if text_hash in translation_cache[file_relative_path]:
+                            # 1. Use cache
+                            translated_text = translation_cache[file_relative_path][text_hash]
+                            print(f"  Reusing cached translation for: {original_text[:70]}{'...' if len(original_text) > 70 else ''}")
+                            print(f"  Cached: {translated_text[:70]}{'...' if len(translated_text) > 70 else ''}\n")
+                        else:
+                            # 2. Translate with API
+                            translated_text, success = self._translate_segment_with_retry(original_text)
+                            
+                            if not success:
+                                file_had_errors = True
+                            
+                            if translated_text:
+                                # 3. Update cache
+                                translation_cache[file_relative_path][text_hash] = translated_text
+
+                        if translated_text:
+                            # Replace the text node with the translated content
+                            text_node.replace_with(translated_text)
+
+            # Write the modified soup back to the file
+            file_path.write_bytes(soup.encode('utf-8'))
+
+            if file_had_errors:
+                translation_status_dict[file_relative_path] = "failed"
+                print(f"Finished processing: {file_path.name} (Some segments failed)\n")
+            else:
+                translation_status_dict[file_relative_path] = "completed"
+                print(f"Finished processing: {file_path.name} (All segments successful)\n")
+            return True
+        except Exception as e:
+            print(f"Critical error processing HTML file {file_path.name}: {e}")
+            translation_status_dict[file_relative_path] = "failed"
+            return False
+
+    def _create_translated_epub(self, source_dir, output_epub_path):
+        """Creates a new EPUB file from the modified contents."""
+        try:
+            mimetype_path = source_dir / 'mimetype'
+            if not mimetype_path.exists():
+                print("Error: mimetype file not found. Cannot create EPUB.")
+                return False
+
+            with zipfile.ZipFile(output_epub_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                # Mimetype must be uncompressed and first in the ZIP archive
+                zf.write(mimetype_path, 'mimetype', compress_type=zipfile.ZIP_STORED)
+
+                # Recursively write all other files
+                for item in source_dir.rglob('*'):
+                    if item.is_file() and item.name != 'mimetype':
+                        arcname = item.relative_to(source_dir).as_posix()
+                        zf.write(item, arcname)
+            
+            print(f"Translated EPUB created at: {output_epub_path}")
+            return True
+        except Exception as e:
+            print(f"Error creating translated EPUB: {e}")
+            return False
+
+    def _cleanup_temp_dir(self, temp_dir):
+        """Removes the temporary directory."""
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+            print(f"Cleaned up temporary directory: {temp_dir}")
+
+    def translate_epub(self, epub_path, output_dir, temp_dir_path, prompt_file=None):
+        """The main orchestration method for the translation process."""
+        
+        # --- File Path Setup ---
+        epub_path = Path(epub_path).resolve()
+        output_dir = Path(output_dir).resolve()
+        
+        epub_filename = epub_path.name
+        epub_name_without_ext = epub_path.stem
+
+        if temp_dir_path:
+            temp_dir = Path(temp_dir_path).resolve()
+        else:
+            temp_dir = Path.cwd() / f'temp_epub_translation_{epub_name_without_ext}'
+
+        output_epub_filename = f"{epub_name_without_ext}_zh-Hans.epub"
+        output_epub_path = output_dir / output_epub_filename
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        status_file_path = temp_dir / f'{epub_name_without_ext}_file_status.json'
+        cache_file_path = temp_dir / f'{epub_name_without_ext}_translation_cache.json'
+
+        # --- Load Prompt ---
+        translation_base_prompt = self.base_prompt
+        if prompt_file:
+            try:
+                custom_prompt_content = Path(prompt_file).read_text(encoding='utf-8').strip()
+                if custom_prompt_content:
+                    translation_base_prompt = custom_prompt_content + "\n\n"
+                    print(f"Using custom prompt from: {prompt_file}")
+            except Exception as e:
+                print(f"Warning: Could not read prompt file '{prompt_file}': {e}. Using default prompt.")
+
+        self.base_prompt = translation_base_prompt
+        
+        # --- Load State (Status and Cache) ---
+        translation_status = {}
+        translation_cache = {}
+        
+        try:
+            if status_file_path.exists():
+                translation_status = json.loads(status_file_path.read_text(encoding='utf-8'))
+                print(f"Loaded previous file-level translation status from: {status_file_path}")
+            if cache_file_path.exists():
+                translation_cache = json.loads(cache_file_path.read_text(encoding='utf-8'))
+                print(f"Loaded previous sentence-level translation cache from: {cache_file_path}")
+        except json.JSONDecodeError:
+            print("Warning: Failed to decode status/cache JSON. Starting fresh for this EPUB.")
+        except Exception as e:
+            print(f"Warning: Error loading state files: {e}. Starting fresh.")
+
+        print(f"\n--- Starting EPUB Translation for '{epub_filename}' ---")
+        print(f"Temporary directory: {temp_dir}")
+        print(f"Output EPUB will be saved to: {output_epub_path}")
+
+        # --- Extraction ---
+        if not (temp_dir / 'mimetype').exists():
+             print(f"Temporary directory '{temp_dir.name}' is empty. Extracting EPUB.")
+             if not self._extract_epub(epub_path, temp_dir):
+                 self._cleanup_temp_dir(temp_dir)
+                 return
+        else:
+            print(f"Temporary directory '{temp_dir.name}' already contains files. Re-using for incremental translation.")
+
+        # --- Translation Loop ---
+        try:
+            html_files = self._find_html_files(temp_dir)
+            if not html_files:
+                print("No HTML/XHTML files found in the EPUB. Nothing to translate.")
+                return
+
+            print(f"Found {len(html_files)} HTML files in EPUB structure.")
+            reprocessed_files_count = 0
+            skipped_files_count = 0
+
+            # Initial API setup attempt
+            if self.client is None and not self._cycle_to_next_config():
+                 print("Critical: Failed to set up any Gemini API key/model combination initially. Exiting.")
+                 return
+
+            for i, html_file_path in enumerate(html_files):
+                html_file_rel_path = html_file_path.relative_to(temp_dir).as_posix()
+                current_file_status = translation_status.get(html_file_rel_path, "pending")
+
+                if current_file_status == "completed":
+                    print(f"Skipping completed file {i+1}/{len(html_files)}: {html_file_path.name}")
+                    skipped_files_count += 1
+                    continue
+
+                print(f"\n--- Translating file {i+1}/{len(html_files)}: {html_file_path.name} --- (Status: {current_file_status}, Model: {self.model_name})")
+                
+                if self._translate_html_file(html_file_path, temp_dir, translation_status, translation_cache):
+                    reprocessed_files_count += 1
+                
+                # Save status and cache after every file processed
+                status_file_path.write_text(json.dumps(translation_status, indent=4, ensure_ascii=False), encoding='utf-8')
+                cache_file_path.write_text(json.dumps(translation_cache, indent=4, ensure_ascii=False), encoding='utf-8')
+
+            print(f"\nProcessed {reprocessed_files_count} files, skipped {skipped_files_count} already completed files.")
+
+            # --- Final EPUB Creation ---
+            if self._create_translated_epub(temp_dir, output_epub_path):
+                print(f"\nTranslation complete! Translated EPUB saved to: {output_epub_path}")
+            else:
+                print("\nFailed to create the translated EPUB.")
+
+        finally:
+            all_completed = all(status == "completed" for status in translation_status.values())
+            if all_completed and status_file_path.exists() and cache_file_path.exists():
+                self._cleanup_temp_dir(temp_dir)
+                print(f"Cleaned up temporary directory: {temp_dir}")
+            else:
+                print(f"\nTemporary directory '{temp_dir.name}', status, and cache preserved for incremental translation (some files may still be 'failed' or 'pending').")
+
+            print("\n--- Translation Process Finished ---")
 
 # --- Main Command-Line Process ---
 
@@ -352,156 +450,41 @@ def main():
 
     args = parser.parse_args()
 
-    global _api_keys
+    # --- API Key Acquisition ---
+    api_keys = []
     if args.api_keys:
-        _api_keys = args.api_keys
-        print(f"Using {len(_api_keys)} API Key(s) from command line arguments.")
+        api_keys = args.api_keys
+        print(f"Using {len(api_keys)} API Key(s) from command line arguments.")
     else:
         env_api_key = os.getenv("GOOGLE_API_KEY")
         if env_api_key:
-            _api_keys = [env_api_key]
+            api_keys = [env_api_key]
             print("Using API Key from GOOGLE_API_KEY environment variable.")
         else:
             print("Error: No API Key(s) provided. Please use --api_keys KEY1 KEY2... or set GOOGLE_API_KEY environment variable.")
             return
-    
-    if not _api_keys:
+
+    if not api_keys:
         print("Error: No valid API keys found. Exiting.")
         return
 
-    # Initial API setup attempt with first API key and model
-    if not get_next_api_key_and_model_and_setup(is_initial_setup=True):
-        print("Failed to set up any Gemini API key/model combination initially. Please check your keys or network. Exiting.")
-        return
-
-    translation_base_prompt = DEFAULT_TRANSLATION_PROMPT
-    if args.prompt_file:
-        try:
-            with open(args.prompt_file, 'r', encoding='utf-8') as f:
-                custom_prompt_content = f.read().strip()
-                if custom_prompt_content:
-                    translation_base_prompt = custom_prompt_content + "\n\n"
-                    print(f"Using custom prompt from: {args.prompt_file}")
-                else:
-                    print(f"Warning: Prompt file '{args.prompt_file}' is empty. Using default prompt.")
-        except FileNotFoundError:
-            print(f"Warning: Prompt file '{args.prompt_file}' not found. Using default prompt.")
-        except Exception as e:
-            print(f"Warning: Could not read prompt file '{args.prompt_file}': {e}. Using default prompt.")
-    else:
-        print("Using default translation prompt.")
-
-    epub_path = os.path.abspath(args.epub_file_path)
-    if not os.path.exists(epub_path):
-        print(f"Error: EPUB file not found at '{epub_path}'")
-        return
-    if not epub_path.lower().endswith(".epub"):
-        print(f"Error: The provided file '{epub_path}' does not appear to be an EPUB file.")
-        return
-
-    epub_filename = os.path.basename(epub_path)
-    epub_name_without_ext = os.path.splitext(epub_filename)[0]
-
-    if args.temp_dir:
-        temp_dir = os.path.abspath(args.temp_dir)
-        print(f"Using specified temporary directory: {temp_dir}")
-    else:
-        temp_dir = os.path.join(os.getcwd(), f'temp_epub_translation_{epub_name_without_ext}')
-        print(f"Using default temporary directory: {temp_dir}")
-
-    output_epub_filename = f"{epub_name_without_ext}_zh-Hans.epub"
-    output_epub_path = os.path.join(os.path.abspath(args.output_dir), output_epub_filename)
-    
-    status_file_path = os.path.join(temp_dir, f'{epub_name_without_ext}_file_status.json')
-    cache_file_path = os.path.join(temp_dir, f'{epub_name_without_ext}_translation_cache.json')
-
-    os.makedirs(os.path.abspath(args.output_dir), exist_ok=True)
-    os.makedirs(temp_dir, exist_ok=True)
-
-    translation_status = {}
-    translation_cache = {}
-
-    if os.path.exists(status_file_path):
-        try:
-            with open(status_file_path, 'r', encoding='utf-8') as f:
-                translation_status = json.load(f)
-            print(f"Loaded previous file-level translation status from: {status_file_path}")
-        except json.JSONDecodeError:
-            print(f"Warning: Could not read file-level translation status file '{status_file_path}'. Starting fresh for this EPUB.")
-        except Exception as e:
-            print(f"Warning: Error loading file-level translation status: {e}. Starting fresh for this EPUB.")
-    
-    if os.path.exists(cache_file_path):
-        try:
-            with open(cache_file_path, 'r', encoding='utf-8') as f:
-                translation_cache = json.load(f)
-            print(f"Loaded previous sentence-level translation cache from: {cache_file_path}")
-        except json.JSONDecodeError:
-            print(f"Warning: Could not read sentence-level translation cache file '{cache_file_path}'. Starting fresh for this EPUB.")
-        except Exception as e:
-            print(f"Warning: Error loading sentence-level translation cache: {e}. Starting fresh for this EPUB.")
-
-
-    print(f"\n--- Starting EPUB Translation for '{epub_filename}' ---")
-    print(f"Using model: {_current_model_name}")
-    print(f"Temporary directory: {temp_dir}")
-    print(f"Output EPUB will be saved to: {output_epub_path}")
-
-    if not os.path.exists(temp_dir) or not os.listdir(temp_dir):
-         print(f"Temporary directory '{temp_dir}' is empty or does not exist. Extracting EPUB.")
-         if not extract_epub(epub_path, temp_dir):
-             cleanup_temp_dir(temp_dir)
-             return
-    else:
-        print(f"Temporary directory '{temp_dir}' already exists with files. Re-using for incremental translation.")
-
     try:
-        html_files = find_html_files(temp_dir)
-        if not html_files:
-            print("No HTML/XHTML files found in the EPUB. Nothing to translate.")
-            return
+        translator = GeminiEPUBTranslator(
+            api_keys=api_keys, 
+            models=MODELS, 
+            base_prompt=DEFAULT_TRANSLATION_PROMPT
+        )
+        translator.translate_epub(
+            epub_path=args.epub_file_path,
+            output_dir=args.output_dir,
+            temp_dir_path=args.temp_dir,
+            prompt_file=args.prompt_file
+        )
+    except ValueError as e:
+        print(f"Configuration Error: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred during the main process: {e}")
 
-        print(f"Found {len(html_files)} HTML files in EPUB structure.")
-        reprocessed_files_count = 0
-        skipped_files_count = 0
 
-        for i, html_file_abs_path in enumerate(html_files):
-            html_file_rel_path = os.path.relpath(html_file_abs_path, temp_dir)
-
-            current_file_status = translation_status.get(html_file_rel_path, "pending")
-
-            if current_file_status == "completed":
-                print(f"Skipping already completed file {i+1}/{len(html_files)}: {os.path.basename(html_file_abs_path)}")
-                skipped_files_count += 1
-                continue
-
-            print(f"\n--- Translating file {i+1}/{len(html_files)}: {os.path.basename(html_file_abs_path)} --- (Status: {current_file_status})")
-            if translate_html_file(html_file_abs_path, translation_base_prompt, translation_status, translation_cache):
-                reprocessed_files_count += 1
-            
-            with open(status_file_path, 'w', encoding='utf-8') as f:
-                json.dump(translation_status, f, indent=4)
-            
-            with open(cache_file_path, 'w', encoding='utf-8') as f:
-                json.dump(translation_cache, f, indent=4, ensure_ascii=False)
-
-        print(f"\nProcessed {reprocessed_files_count} files, skipped {skipped_files_count} already completed files.")
-
-        if create_translated_epub(temp_dir, output_epub_path):
-            print(f"\nTranslation complete! Translated EPUB saved to: {output_epub_path}")
-        else:
-            print("\nFailed to create the translated EPUB.")
-
-    finally:
-        all_completed = all(status == "completed" for status in translation_status.values())
-        if all_completed and os.path.exists(temp_dir) and os.path.exists(status_file_path) and os.path.exists(cache_file_path):
-            cleanup_temp_dir(temp_dir)
-            print(f"Cleaned up temporary directory: {temp_dir}")
-        else:
-            print(f"\nTemporary directory '{temp_dir}', file status '{status_file_path}', and sentence cache '{cache_file_path}' preserved for incremental translation (some files may still be 'failed' or 'pending').")
-
-        print("\n--- Translation Process Finished ---")
-
-# --- Run the script ---
 if __name__ == "__main__":
     main()
